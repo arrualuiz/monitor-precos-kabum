@@ -20,6 +20,12 @@ const PRODUCTS = [
 ];
 
 function setupMonitor() {
+  // PROTECAO: esta funcao APAGA todas as abas (inclusive Historico e coletas) e recria a planilha do zero.
+  // So mude para true se quiser mesmo resetar tudo; depois volte para false.
+  const CONFIRMAR_RESET_TOTAL = false;
+  if (!CONFIRMAR_RESET_TOTAL) {
+    throw new Error('setupMonitor() apaga todos os dados. Mude CONFIRMAR_RESET_TOTAL para true se quiser mesmo recriar a planilha.');
+  }
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const keepNames = ['Config', 'Produtos', 'Coletas_Brutas', 'Coletas_Fatiadas', 'Historico', 'Acompanhamento', 'Dashboard', 'Logs'];
   ss.getSheets().forEach(sheet => {
@@ -117,7 +123,7 @@ function collectProduct_(ss, row, idx) {
     });
     const status = response.getResponseCode();
     const html = response.getContentText();
-    const parsed = parseKabum_(html);
+    const parsed = parseKabum_(html, row[idx.url]);
     const rawText = stripHtml_(html).slice(0, 1500);
     const rawPrices = findPrices_(stripHtml_(html));
 
@@ -125,10 +131,12 @@ function collectProduct_(ss, row, idx) {
     append_(ss, 'Coletas_Fatiadas', [[coletaId, now, row[idx.id], row[idx.nome], row[idx.loja], row[idx.url], parsed.precoDe, parsed.precoPix, parsed.descontoPix, parsed.parcelamento, parsed.precoParcela, parsed.qtdParcelas, parsed.selector, parsed.status, parsed.confianca, parsed.obs]]);
 
     const history = ss.getSheetByName('Historico');
-    const lastPrice = getLastPrice_(history, row[idx.id]);
-    const minPrice = getMinPrice_(history, row[idx.id], parsed.precoPix);
-    const deltaAlvo = row[idx.preco_alvo] ? parsed.precoPix - Number(row[idx.preco_alvo]) : '';
-    const variation = lastPrice ? parsed.precoPix - lastPrice : '';
+    const refPrice = Number(row[idx.preco_maximo]) || 0;
+    const temPreco = typeof parsed.precoPix === 'number' && parsed.precoPix > 0;
+    const lastPrice = getLastPrice_(history, row[idx.id], refPrice);
+    const minPrice = getMinPrice_(history, row[idx.id], temPreco ? parsed.precoPix : '', refPrice);
+    const deltaAlvo = row[idx.preco_alvo] && temPreco ? round2_(parsed.precoPix - Number(row[idx.preco_alvo])) : '';
+    const variation = lastPrice && temPreco ? round2_(parsed.precoPix - lastPrice) : '';
     const statusPreco = getStatusPrice_(parsed.precoPix, row[idx.preco_alvo], row[idx.preco_maximo], parsed.status);
     append_(ss, 'Historico', [[now, row[idx.id], row[idx.nome], row[idx.loja], row[idx.url], parsed.precoDe, parsed.precoPix, row[idx.preco_alvo], deltaAlvo, variation, minPrice, statusPreco, parsed.descontoPix, parsed.parcelamento, '']]);
   } catch (err) {
@@ -136,44 +144,191 @@ function collectProduct_(ss, row, idx) {
   }
 }
 
-function parseKabum_(html) {
+function parseKabum_(html, url) {
   const text = stripHtml_(html);
   const prices = findPrices_(text);
-  const h4Match = html.match(/<h4[^>]*>(.*?)<\/h4>/is);
-  const h4Price = h4Match ? findPrices_(stripHtml_(h4Match[1]))[0] : '';
   const titleMatch = html.match(/<h1[^>]*>(.*?)<\/h1>/is) || html.match(/<title[^>]*>(.*?)<\/title>/is);
   const discountMatch = text.match(/(?:À|A) vista no PIX com \d+% de desconto/i);
   const installmentMatch = text.match(/\d+x\s*R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}.{0,80}?(?:juros|NuPay|cart[aã]o)/i) || text.match(/\d+x\s*R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}.{0,40}/i);
   const installmentText = installmentMatch ? installmentMatch[0].trim() : '';
   const installmentPrice = installmentText.match(/R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}/);
   const installmentQty = installmentText.match(/(\d+)x/i);
-  const pixText = h4Price || prices[1] || prices[0] || '';
+
+  // Ordem de confianca do preco PIX:
+  // 1) JSON do Next.js da Kabum: "prices":{"oldPrice","priceWithDiscount","price","discountPercentage"}
+  // 2) JSON-LD (schema.org Product > offers.price)
+  // 3) <h4> (layout antigo da pagina)
+  // Nao usa mais o "segundo R$ da pagina" como fallback: era isso que gravava o valor da PARCELA como preco PIX.
+  const next = extractKabumPrices_(html, url);
+  const ldPrice = next ? '' : extractLdJsonPrice_(html);
+  const h4Match = (next || ldPrice) ? null : html.match(/<h4[^>]*>(.*?)<\/h4>/is);
+  const h4Price = h4Match ? parsePrice_(findPrices_(stripHtml_(h4Match[1]))[0]) : '';
+
+  let precoPix = '', precoDe = '', selector = 'nenhum', confianca = 'Baixa';
+  if (next) {
+    precoPix = next.priceWithDiscount; precoDe = next.price; selector = 'next_data'; confianca = 'Alta';
+  } else if (ldPrice) {
+    precoPix = ldPrice; precoDe = parsePrice_(prices[0]); selector = 'ld_json'; confianca = 'Alta';
+  } else if (h4Price) {
+    precoPix = h4Price; precoDe = parsePrice_(prices[0]); selector = 'h4'; confianca = 'Media';
+  }
+
   return {
     titulo: titleMatch ? stripHtml_(titleMatch[1]) : '',
-    precoDe: parsePrice_(prices[0]),
-    precoPix: parsePrice_(pixText),
-    descontoPix: discountMatch ? discountMatch[0] : '',
+    precoDe: precoDe,
+    precoPix: precoPix,
+    descontoPix: next && next.discountPercentage ? next.discountPercentage + '% de desconto no PIX' : (discountMatch ? discountMatch[0] : ''),
     parcelamento: installmentText,
     precoParcela: installmentPrice ? parsePrice_(installmentPrice[0]) : '',
     qtdParcelas: installmentQty ? Number(installmentQty[1]) : '',
-    selector: h4Price ? 'h4' : 'fallback_prices',
-    status: pixText ? 'OK' : 'ERRO',
-    confianca: h4Price ? 'Alta' : 'Media',
+    selector: selector,
+    status: precoPix ? 'OK' : 'ERRO',
+    confianca: confianca,
     obs: prices.slice(0, 8).join(' | ')
   };
 }
 
+function extractKabumPrices_(html, url) {
+  const re = /"prices":\{([^{}]*)\}/g;
+  const slug = String(url || '').split('?')[0].split('/').filter(String).pop() || '';
+  const pos = slug ? html.indexOf('"friendlyName":"' + slug + '"') : -1;
+  re.lastIndex = pos >= 0 ? pos : 0;
+  let m = re.exec(html);
+  if (!m && pos > 0) {
+    re.lastIndex = 0;
+    m = re.exec(html);
+  }
+  if (!m) return null;
+  const bloco = m[1];
+  const num = key => {
+    const x = bloco.match(new RegExp('"' + key + '":(-?[\\d.]+)'));
+    return x ? Number(x[1]) : 0;
+  };
+  const r = {
+    oldPrice: num('oldPrice'),
+    priceWithDiscount: num('priceWithDiscount'),
+    price: num('price'),
+    discountPercentage: num('discountPercentage')
+  };
+  return r.priceWithDiscount > 0 ? r : null;
+}
+
+function extractLdJsonPrice_(html) {
+  const blocos = html.match(/<script[^>]*application\/ld\+json[^>]*>[\s\S]*?<\/script>/gi) || [];
+  for (const b of blocos) {
+    try {
+      const json = JSON.parse(b.replace(/^<script[^>]*>/i, '').replace(/<\/script>$/i, ''));
+      const itens = [].concat(json['@graph'] || json);
+      for (const it of itens) {
+        if (it && it['@type'] === 'Product' && it.offers) {
+          const oferta = [].concat(it.offers)[0];
+          const p = Number(oferta.price || oferta.lowPrice);
+          if (p > 0) return p;
+        }
+      }
+    } catch (e) {
+      // bloco JSON-LD invalido: ignora e tenta o proximo
+    }
+  }
+  return '';
+}
+
+// Preco abaixo de 50% da referencia (preco_maximo da aba Produtos) e tratado como leitura errada
+// (ex.: o scraper pegou o valor da parcela). Essas coletas sao ignoradas na aba Acompanhamento.
+const LIMITE_PRECO_SUSPEITO = 0.5;
+
 function atualizarAcompanhamento() {
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const sheet = ss.getSheetByName('Acompanhamento');
-  sheet.clearContents();
-  sheet.getRange(1, 1, 1, 13).setValues([[
-    'id_produto', 'nome', 'loja', 'preco_atual', 'preco_anterior', 'variacao_abs',
-    'variacao_pct', 'menor_preco', 'maior_preco', 'media_7_coletas',
-    'status_preco', 'ultima_coleta', 'url'
-  ]]);
-  sheet.getRange(2, 1).setFormula('=QUERY(Historico!A:O;"select B,C,D,G,G,0,0,min(G),max(G),avg(G),L,max(A),E where B is not null group by B,C,D,G,L,E label min(G) \'\', max(G) \'\', avg(G) \'\', max(A) \'\'";1)');
+  const prodValues = ss.getSheetByName('Produtos').getDataRange().getValues();
+  const pHead = prodValues.shift();
+  const p = Object.fromEntries(pHead.map((h, i) => [h, i]));
+  const hist = ss.getSheetByName('Historico').getDataRange().getValues().slice(1);
+
+  const header = [
+    'id_produto', 'nome', 'loja', 'preco_atual', 'preco_anterior', 'variacao_abs', 'variacao_pct',
+    'tendencia', 'ultima_mudanca', 'menor_preco', 'maior_preco', 'media_7_coletas', 'status_preco',
+    'ultima_coleta_valida', 'coletas_ignoradas', 'url'
+  ];
+
+  const rows = prodValues.filter(r => r[p.id]).map(r => {
+    const id = r[p.id];
+    const ref = Number(r[p.preco_maximo]) || 0;
+    const doProduto = hist.filter(h => h[1] === id);
+    const validas = doProduto.filter(h => precoValido_(h[6], ref));
+    const ignoradas = doProduto.length - validas.length;
+    if (!validas.length) {
+      return [id, r[p.nome], r[p.loja], '', '', '', '', 'Sem dados', '', '', '', '', 'ERRO', '', ignoradas, r[p.url]];
+    }
+
+    const precos = validas.map(h => h[6]);
+    const atual = precos[precos.length - 1];
+    const anterior = precos.length > 1 ? precos[precos.length - 2] : '';
+    const varAbs = anterior === '' ? '' : round2_(atual - anterior);
+    const varPct = anterior === '' ? '' : (atual - anterior) / anterior;
+    let tendencia = 'Primeira coleta';
+    if (anterior !== '') tendencia = varAbs > 0 ? '▲ Subiu' : varAbs < 0 ? '▼ Caiu' : '→ Igual';
+
+    let ultimaMudanca = 'Sem mudança';
+    for (let i = validas.length - 1; i > 0; i--) {
+      const de = validas[i - 1][6];
+      const para = validas[i][6];
+      if (de !== para) {
+        const dia = Utilities.formatDate(new Date(validas[i][0]), TIMEZONE, 'dd/MM');
+        ultimaMudanca = (para > de ? '▲ ' : '▼ ') + dia + ': ' + fmtBRL_(de) + ' → ' + fmtBRL_(para);
+        break;
+      }
+    }
+
+    const ult7 = precos.slice(-7);
+    const media7 = round2_(ult7.reduce((a, b) => a + b, 0) / ult7.length);
+    const status = getStatusPrice_(atual, r[p.preco_alvo], r[p.preco_maximo], 'OK');
+    return [
+      id, r[p.nome], r[p.loja], atual, anterior, varAbs, varPct, tendencia, ultimaMudanca,
+      Math.min.apply(null, precos), Math.max.apply(null, precos), media7, status,
+      validas[validas.length - 1][0], ignoradas, r[p.url]
+    ];
+  });
+
+  sheet.clear();
+  sheet.clearConditionalFormatRules();
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  if (rows.length) {
+    const last = rows.length + 1;
+    sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
+    ['D', 'E', 'F', 'J', 'K', 'L'].forEach(c => sheet.getRange(c + '2:' + c + last).setNumberFormat('"R$" #,##0.00'));
+    sheet.getRange('G2:G' + last).setNumberFormat('+0.0%;-0.0%;0.0%');
+    sheet.getRange('N2:N' + last).setNumberFormat('dd/MM/yyyy HH:mm');
+
+    const verde = '#d9f2e3', vermelho = '#fbe0e0';
+    const variacao = sheet.getRange('F2:H' + last);
+    const mudanca = sheet.getRange('I2:I' + last);
+    const faixaStatus = sheet.getRange('M2:M' + last);
+    sheet.setConditionalFormatRules([
+      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$F2<0').setBackground(verde).setFontColor('#137333').setRanges([variacao]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$F2>0').setBackground(vermelho).setFontColor('#a50e0e').setRanges([variacao]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextStartsWith('▼').setFontColor('#137333').setRanges([mudanca]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextStartsWith('▲').setFontColor('#a50e0e').setRanges([mudanca]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('COMPRAR').setBackground(verde).setBold(true).setRanges([faixaStatus]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('CARO').setFontColor('#a50e0e').setRanges([faixaStatus]).build()
+    ]);
+  }
   formatSheet_(sheet);
+  console.log('Acompanhamento atualizado: ' + rows.length + ' produtos');
+}
+
+// Roda o parser em todos os produtos ativos e so mostra no log (nao grava nada na planilha).
+function testarParserKabum() {
+  const values = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName('Produtos').getDataRange().getValues();
+  const headers = values.shift();
+  const idx = Object.fromEntries(headers.map((h, i) => [h, i]));
+  const ativos = values.filter(r => r[idx.ativo] === true && r[idx.url]);
+  console.log('Produtos ativos: ' + ativos.length);
+  ativos.forEach(r => {
+    const resp = UrlFetchApp.fetch(r[idx.url], {muteHttpExceptions: true, followRedirects: true, headers: {'User-Agent': 'Mozilla/5.0 MonitorPrecos/1.0'}});
+    const parsed = parseKabum_(resp.getContentText(), r[idx.url]);
+    console.log(r[idx.id] + ' | HTTP ' + resp.getResponseCode() + ' | PIX ' + parsed.precoPix + ' | normal ' + parsed.precoDe + ' | ' + parsed.selector + ' | ' + parsed.descontoPix);
+  });
 }
 
 function criarGatilhoDiario23h() {
@@ -234,15 +389,29 @@ function parsePrice_(priceText) {
   return Number(String(priceText).replace(/[^\d,]/g, '').replace(',', '.'));
 }
 
-function getLastPrice_(history, productId) {
-  const data = history.getDataRange().getValues().slice(1).filter(r => r[1] === productId && typeof r[6] === 'number');
+function getLastPrice_(history, productId, ref) {
+  const data = history.getDataRange().getValues().slice(1).filter(r => r[1] === productId && precoValido_(r[6], ref));
   return data.length ? data[data.length - 1][6] : '';
 }
 
-function getMinPrice_(history, productId, current) {
-  const prices = history.getDataRange().getValues().slice(1).filter(r => r[1] === productId && typeof r[6] === 'number').map(r => r[6]);
-  if (typeof current === 'number') prices.push(current);
+function getMinPrice_(history, productId, current, ref) {
+  const prices = history.getDataRange().getValues().slice(1).filter(r => r[1] === productId && precoValido_(r[6], ref)).map(r => r[6]);
+  if (precoValido_(current, ref)) prices.push(current);
   return prices.length ? Math.min.apply(null, prices) : '';
+}
+
+function precoValido_(preco, ref) {
+  if (typeof preco !== 'number' || !(preco > 0)) return false;
+  return !ref || preco >= ref * LIMITE_PRECO_SUSPEITO;
+}
+
+function round2_(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function fmtBRL_(n) {
+  const partes = Number(n).toFixed(2).split('.');
+  return 'R$ ' + partes[0].replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ',' + partes[1];
 }
 
 function getStatusPrice_(price, target, max, parseStatus) {
