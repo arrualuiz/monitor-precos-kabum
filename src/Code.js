@@ -1,5 +1,8 @@
 const SPREADSHEET_ID = '1hgSeSzOpBzxyJji-S2GPG8xECaZlpr0RlBsaCNQrLZE';
 const TIMEZONE = 'America/Sao_Paulo';
+const DATETIME_FORMAT = 'dd/MM/yyyy HH:mm:ss';
+// Coluna (1-based) de data_hora em cada aba que recebe linhas novas.
+const COLUNAS_DATA_HORA = {Coletas_Brutas: 2, Coletas_Fatiadas: 2, Historico: 1, Logs: 1};
 
 const PRODUCTS = [
   ['GPU-001', 'Placa De Video Husky Alpha RX 580', 'Placa de video', 'RX 580 8GB', 'Kabum', 'https://www.kabum.com.br/produto/692461/placa-de-video-husky-alpha-rx-580-amd-8gb-gddr5-256-bit-hdmi-dvi-displayport-hvg580', '', 929.99, 'Media'],
@@ -47,9 +50,9 @@ function setupMonitor() {
   sheets.config.getRange(1, 1, 7, 2).setValues([
     ['Chave', 'Valor'],
     ['timezone', TIMEZONE],
-    ['frequencia_sugerida', 'Diariamente perto das 23h'],
+    ['frequencia_sugerida', 'Diariamente perto das 23h (criarGatilhoDiario23h)'],
     ['lojas_ativas', 'Kabum'],
-    ['parser_kabum', 'preco_pix=h4; preco_de=primeiro R$; desconto=texto PIX; parcelamento=10x R$'],
+    ['parser_kabum', PARSER_KABUM_DESC],
     ['ultima_configuracao', new Date()],
     ['observacao', 'Screenshots exigem automacao externa; Apps Script faz coleta textual.']
   ]);
@@ -62,10 +65,10 @@ function setupMonitor() {
     p[0], true, p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], 'h4', 'Carga inicial 2026-08-29', ''
   ]));
 
-  sheets.raw.getRange(1, 1, 1, 12).setValues([[
+  sheets.raw.getRange(1, 1, 1, 13).setValues([[
     'coleta_id', 'data_hora', 'id_produto', 'loja', 'url', 'status_http',
     'titulo_extraido', 'html_tamanho', 'texto_bruto_inicio', 'precos_detectados',
-    'erro', 'hash_simples'
+    'erro', 'hash_simples', 'status_coleta'
   ]]);
 
   sheets.parsed.getRange(1, 1, 1, 16).setValues([[
@@ -86,35 +89,42 @@ function setupMonitor() {
     'status_preco', 'ultima_coleta', 'url'
   ]]);
 
-  sheets.dash.getRange(1, 1, 8, 2).setValues([
-    ['Indicador', 'Valor'],
-    ['Produtos ativos', '=COUNTIF(Produtos!B:B;TRUE)'],
-    ['Ultimas coletas', '=COUNTA(Historico!A:A)-1'],
-    ['Melhor preco monitorado', '=MIN(Historico!G:G)'],
-    ['Alertas COMPRAR', '=COUNTIF(Historico!L:L;"COMPRAR")'],
-    ['Erros de coleta', '=COUNTIF(Coletas_Fatiadas!N:N;"ERRO")'],
-    ['Ultima atualizacao', '=MAX(Historico!A:A)'],
-    ['Proxima etapa', 'Criar graficos e cards depois de algumas coletas']
-  ]);
-
   sheets.logs.getRange(1, 1, 1, 6).setValues([['data_hora', 'nivel', 'funcao', 'id_produto', 'mensagem', 'detalhe']]);
   Object.values(sheets).forEach(formatSheet_);
+  atualizarAcompanhamento();
+  atualizarDashboard();
 }
 
+const PARSER_KABUM_DESC = 'preco_pix=__NEXT_DATA__ prices.priceWithDiscount (fallback: JSON-LD offers.price, depois h4); preco_de=prices.price; parcelamento=texto 10x R$';
+
 function coletarAgora() {
+  const inicio = new Date();
   const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
   const productsSheet = ss.getSheetByName('Produtos');
   const values = productsSheet.getDataRange().getValues();
   const headers = values.shift();
   const idx = Object.fromEntries(headers.map((h, i) => [h, i]));
-  const active = values.filter(r => r[idx.ativo] === true && r[idx.url]);
-  active.forEach(row => collectProduct_(ss, row, idx));
+  const active = values
+    .map((row, i) => ({row: row, linha: i + 2}))
+    .filter(x => x.row[idx.ativo] === true && x.row[idx.url]);
+
+  log_(ss, 'INFO', 'coletarAgora', '', 'Coleta iniciada', active.length + ' produtos ativos');
+  const resultados = active.map(x => collectProduct_(ss, x.row, idx, x.linha));
+  const ok = resultados.filter(s => s === 'OK').length;
+  const erros = resultados.length - ok;
+  const segundos = Math.round((new Date() - inicio) / 1000);
+  log_(ss, erros ? 'AVISO' : 'INFO', 'coletarAgora', '', 'Coleta finalizada: ' + ok + ' OK, ' + erros + ' ERRO', segundos + 's');
+
   atualizarAcompanhamento();
+  atualizarDashboard();
 }
 
-function collectProduct_(ss, row, idx) {
+// Coleta um produto e grava em Coletas_Brutas, Coletas_Fatiadas e Historico.
+// Retorna 'OK' ou 'ERRO' (o mesmo valor gravado em Coletas_Brutas.status_coleta).
+function collectProduct_(ss, row, idx, linhaProduto) {
   const now = new Date();
   const coletaId = Utilities.formatDate(now, TIMEZONE, 'yyyyMMdd-HHmmss') + '-' + row[idx.id];
+  const refPrice = Number(row[idx.preco_maximo]) || 0;
   try {
     const response = UrlFetchApp.fetch(row[idx.url], {
       muteHttpExceptions: true,
@@ -126,22 +136,46 @@ function collectProduct_(ss, row, idx) {
     const parsed = parseKabum_(html, row[idx.url]);
     const rawText = stripHtml_(html).slice(0, 1500);
     const rawPrices = findPrices_(stripHtml_(html));
+    const avaliacao = avaliarColeta_(status, parsed, refPrice);
 
-    append_(ss, 'Coletas_Brutas', [[coletaId, now, row[idx.id], row[idx.loja], row[idx.url], status, parsed.titulo, html.length, rawText, rawPrices.join(' | '), '', simpleHash_(html)]]);
+    append_(ss, 'Coletas_Brutas', [[coletaId, now, row[idx.id], row[idx.loja], row[idx.url], status, parsed.titulo, html.length, rawText, rawPrices.join(' | '), avaliacao.motivo, simpleHash_(html), avaliacao.status]]);
     append_(ss, 'Coletas_Fatiadas', [[coletaId, now, row[idx.id], row[idx.nome], row[idx.loja], row[idx.url], parsed.precoDe, parsed.precoPix, parsed.descontoPix, parsed.parcelamento, parsed.precoParcela, parsed.qtdParcelas, parsed.selector, parsed.status, parsed.confianca, parsed.obs]]);
 
     const history = ss.getSheetByName('Historico');
-    const refPrice = Number(row[idx.preco_maximo]) || 0;
-    const temPreco = typeof parsed.precoPix === 'number' && parsed.precoPix > 0;
+    const temPreco = avaliacao.status === 'OK';
     const lastPrice = getLastPrice_(history, row[idx.id], refPrice);
     const minPrice = getMinPrice_(history, row[idx.id], temPreco ? parsed.precoPix : '', refPrice);
     const deltaAlvo = row[idx.preco_alvo] && temPreco ? round2_(parsed.precoPix - Number(row[idx.preco_alvo])) : '';
     const variation = lastPrice && temPreco ? round2_(parsed.precoPix - lastPrice) : '';
-    const statusPreco = getStatusPrice_(parsed.precoPix, row[idx.preco_alvo], row[idx.preco_maximo], parsed.status);
+    const statusPreco = temPreco ? getStatusPrice_(parsed.precoPix, row[idx.preco_alvo], row[idx.preco_maximo], parsed.status) : 'ERRO';
     append_(ss, 'Historico', [[now, row[idx.id], row[idx.nome], row[idx.loja], row[idx.url], parsed.precoDe, parsed.precoPix, row[idx.preco_alvo], deltaAlvo, variation, minPrice, statusPreco, parsed.descontoPix, parsed.parcelamento, '']]);
+
+    if (linhaProduto && idx.ultima_coleta !== undefined) {
+      ss.getSheetByName('Produtos').getRange(linhaProduto, idx.ultima_coleta + 1).setValue(now).setNumberFormat(DATETIME_FORMAT);
+    }
+    if (avaliacao.status !== 'OK') log_(ss, 'AVISO', 'collectProduct_', row[idx.id], avaliacao.motivo, row[idx.url]);
+    return avaliacao.status;
   } catch (err) {
-    append_(ss, 'Logs', [[now, 'ERRO', 'collectProduct_', row[idx.id], err.message, row[idx.url]]]);
+    append_(ss, 'Coletas_Brutas', [[coletaId, now, row[idx.id], row[idx.loja], row[idx.url], '', '', '', '', '', 'Excecao: ' + err.message, '', 'ERRO']]);
+    log_(ss, 'ERRO', 'collectProduct_', row[idx.id], err.message, row[idx.url]);
+    return 'ERRO';
   }
+}
+
+// Decide se a coleta deu certo. Motivos de ERRO:
+// - HTTP diferente de 200
+// - preco PIX nao encontrado na pagina
+// - preco suspeito: abaixo de LIMITE_PRECO_SUSPEITO x preco_maximo (quase sempre e o valor da parcela)
+function avaliarColeta_(httpStatus, parsed, ref) {
+  if (Number(httpStatus) !== 200) return {status: 'ERRO', motivo: 'HTTP ' + httpStatus};
+  const preco = parsed.precoPix;
+  if (parsed.status !== 'OK' || typeof preco !== 'number' || !(preco > 0)) {
+    return {status: 'ERRO', motivo: 'Preco PIX nao encontrado'};
+  }
+  if (!precoValido_(preco, ref)) {
+    return {status: 'ERRO', motivo: 'Preco suspeito: ' + fmtBRL_(preco) + ' (abaixo de ' + Math.round(LIMITE_PRECO_SUSPEITO * 100) + '% do preco_maximo, provavel parcela)'};
+  }
+  return {status: 'OK', motivo: ''};
 }
 
 function parseKabum_(html, url) {
@@ -331,6 +365,119 @@ function testarParserKabum() {
   });
 }
 
+// Recalcula a aba Dashboard com valores (nao formulas). Chamado no fim de coletarAgora().
+function atualizarDashboard() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const dash = ss.getSheetByName('Dashboard');
+  const agora = new Date();
+
+  const prod = ss.getSheetByName('Produtos').getDataRange().getValues();
+  const pIdx = Object.fromEntries((prod.shift() || []).map((h, i) => [h, i]));
+  const ativos = prod.filter(r => r[pIdx.ativo] === true).length;
+
+  const acomp = ss.getSheetByName('Acompanhamento').getDataRange().getValues();
+  const aIdx = Object.fromEntries((acomp.shift() || []).map((h, i) => [h, i]));
+  const contar = fn => acomp.filter(fn).length;
+
+  const brutas = ss.getSheetByName('Coletas_Brutas').getDataRange().getValues();
+  const bIdx = Object.fromEntries((brutas.shift() || []).map((h, i) => [h, i]));
+  const comData = brutas.filter(r => r[bIdx.data_hora] instanceof Date);
+  const ultima = comData.length ? comData[comData.length - 1][bIdx.data_hora] : null;
+  // "ultima execucao" = coletas gravadas ate 30 min antes da ultima
+  const ultimaExec = ultima ? comData.filter(r => ultima - r[bIdx.data_hora] <= 30 * 60 * 1000) : [];
+  const seteDias = ultima ? comData.filter(r => ultima - r[bIdx.data_hora] <= 7 * 24 * 3600 * 1000) : [];
+  const okDe = rows => rows.filter(r => r[bIdx.status_coleta] === 'OK').length;
+
+  const gatilhos = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'coletarAgora');
+  const horasSemColeta = ultima ? (agora - ultima) / 3600000 : Infinity;
+  let situacao = 'OK';
+  if (!gatilhos.length) situacao = 'SEM GATILHO: rode criarGatilhoDiario23h() no Apps Script';
+  else if (horasSemColeta > 26) situacao = 'ATRASADA: ultima coleta ha ' + Math.round(horasSemColeta) + 'h (veja Apps Script > Execucoes)';
+
+  const linhas = [
+    ['Indicador', 'Valor'],
+    ['Situacao da coleta automatica', situacao],
+    ['Gatilhos de coletarAgora', gatilhos.length ? gatilhos.length + ' ativo(s), diario perto das 23h' : 'nenhum'],
+    ['Ultima coleta', ultima || ''],
+    ['Coletas OK na ultima execucao', okDe(ultimaExec) + ' de ' + ultimaExec.length],
+    ['Coletas OK nos ultimos 7 dias', okDe(seteDias) + ' de ' + seteDias.length],
+    ['Produtos ativos', ativos],
+    ['Produtos que cairam (vs coleta anterior)', contar(r => String(r[aIdx.tendencia]).indexOf('▼') === 0)],
+    ['Produtos que subiram (vs coleta anterior)', contar(r => String(r[aIdx.tendencia]).indexOf('▲') === 0)],
+    ['Alertas COMPRAR (preco atual <= preco_alvo)', contar(r => r[aIdx.status_preco] === 'COMPRAR')],
+    ['Produtos CARO (preco atual > preco_maximo)', contar(r => r[aIdx.status_preco] === 'CARO')],
+    ['Produtos sem preco valido', contar(r => r[aIdx.tendencia] === 'Sem dados')],
+    ['Dashboard atualizado em', agora]
+  ];
+
+  dash.clear();
+  dash.clearConditionalFormatRules();
+  dash.getRange(1, 1, linhas.length, 2).setValues(linhas);
+  dash.getRange(2, 2, linhas.length - 1, 1).setHorizontalAlignment('left');
+  dash.getRange(4, 2).setNumberFormat(DATETIME_FORMAT);
+  dash.getRange(linhas.length, 2).setNumberFormat(DATETIME_FORMAT);
+  dash.setConditionalFormatRules([
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('OK').setBackground('#d9f2e3').setFontColor('#137333').setBold(true).setRanges([dash.getRange('B2')]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextDoesNotContain('OK').setBackground('#fbe0e0').setFontColor('#a50e0e').setBold(true).setRanges([dash.getRange('B2')]).build()
+  ]);
+  formatSheet_(dash);
+}
+
+// Migracao unica (pode rodar de novo sem problema):
+// - data_hora com hora em Coletas_Brutas, Coletas_Fatiadas, Historico e Logs
+// - coluna status_coleta (OK/ERRO) + motivo na coluna erro para as coletas antigas de Coletas_Brutas
+// - Config com a frequencia e o parser atuais
+function migrarColetasBrutasV2() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  Object.keys(COLUNAS_DATA_HORA).forEach(nome => {
+    const sh = ss.getSheetByName(nome);
+    if (sh.getMaxRows() > 1) sh.getRange(2, COLUNAS_DATA_HORA[nome], sh.getMaxRows() - 1, 1).setNumberFormat(DATETIME_FORMAT);
+  });
+
+  const brutas = ss.getSheetByName('Coletas_Brutas');
+  brutas.getRange(1, 13).setValue('status_coleta');
+  const n = brutas.getLastRow() - 1;
+  if (n > 0) {
+    const raw = brutas.getRange(2, 1, n, 13).getValues();
+    const fat = ss.getSheetByName('Coletas_Fatiadas').getDataRange().getValues().slice(1);
+    const porColeta = {};
+    fat.forEach(r => { porColeta[r[0]] = {precoPix: r[7], status: r[13]}; });
+    const prod = ss.getSheetByName('Produtos').getDataRange().getValues();
+    const pIdx = Object.fromEntries((prod.shift() || []).map((h, i) => [h, i]));
+    const refPorId = {};
+    prod.forEach(r => { refPorId[r[pIdx.id]] = Number(r[pIdx.preco_maximo]) || 0; });
+
+    const avaliacoes = raw.map(r => {
+      const parsed = porColeta[r[0]] || {precoPix: '', status: 'ERRO'};
+      return avaliarColeta_(r[5], parsed, refPorId[r[2]]);
+    });
+    brutas.getRange(2, 11, n, 1).setValues(raw.map((r, i) => [r[10] || avaliacoes[i].motivo]));
+    brutas.getRange(2, 13, n, 1).setValues(avaliacoes.map(a => [a.status]));
+  }
+
+  const faixa = brutas.getRange('M2:M');
+  const regras = brutas.getConditionalFormatRules().filter(rule => rule.getRanges()[0].getColumn() !== 13);
+  regras.push(
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('OK').setBackground('#d9f2e3').setFontColor('#137333').setRanges([faixa]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('ERRO').setBackground('#fbe0e0').setFontColor('#a50e0e').setRanges([faixa]).build()
+  );
+  brutas.setConditionalFormatRules(regras);
+  formatSheet_(brutas);
+
+  const config = ss.getSheetByName('Config');
+  const cfg = config.getDataRange().getValues();
+  cfg.forEach((r, i) => {
+    if (r[0] === 'frequencia_sugerida') config.getRange(i + 1, 2).setValue('Diariamente perto das 23h (criarGatilhoDiario23h)');
+    if (r[0] === 'parser_kabum') config.getRange(i + 1, 2).setValue(PARSER_KABUM_DESC);
+  });
+
+  const ok = n > 0 ? brutas.getRange(2, 13, n, 1).getValues().filter(r => r[0] === 'OK').length : 0;
+  log_(ss, 'INFO', 'migrarColetasBrutasV2', '', 'Migracao concluida: ' + ok + ' OK, ' + (n - ok) + ' ERRO em ' + n + ' coletas antigas', '');
+  atualizarDashboard();
+  console.log('Migracao concluida: ' + ok + ' OK de ' + n);
+}
+
 function criarGatilhoDiario23h() {
   ScriptApp.getProjectTriggers().forEach(t => {
     if (t.getHandlerFunction() === 'coletarAgora') ScriptApp.deleteTrigger(t);
@@ -356,7 +503,17 @@ function resetSheet_(ss, name) {
 
 function append_(ss, sheetName, rows) {
   const sheet = ss.getSheetByName(sheetName);
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  const start = sheet.getLastRow() + 1;
+  // A aba tem um numero fixo de linhas (1000 por padrao): cria mais antes de estourar.
+  const falta = start + rows.length - 1 - sheet.getMaxRows();
+  if (falta > 0) sheet.insertRowsAfter(sheet.getMaxRows(), falta + 500);
+  sheet.getRange(start, 1, rows.length, rows[0].length).setValues(rows);
+  const colData = COLUNAS_DATA_HORA[sheetName];
+  if (colData) sheet.getRange(start, colData, rows.length, 1).setNumberFormat(DATETIME_FORMAT);
+}
+
+function log_(ss, nivel, funcao, idProduto, mensagem, detalhe) {
+  append_(ss, 'Logs', [[new Date(), nivel, funcao, idProduto || '', mensagem, detalhe || '']]);
 }
 
 function formatSheet_(sheet) {
