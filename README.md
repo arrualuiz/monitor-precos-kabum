@@ -133,7 +133,7 @@ Gatilho diário (~23h)
 
 ---
 
-## Desenvolvimento local (git + clasp + Claude Code)
+## Desenvolvimento local (git + clasp)
 
 O código vive no Google (Apps Script). O [clasp](https://github.com/google/clasp) sincroniza a pasta `src/` com o projeto online, e o git guarda as versões.
 
@@ -162,7 +162,7 @@ O `.clasp.json` já aponta para o projeto (`scriptId`) e usa `src/` como raiz.
 
 ```bash
 clasp pull                       # antes de começar, se editou algo pelo navegador
-# ... edite src/Code.js (ou peça ao Claude Code) ...
+# ... edite src/Code.js ...
 node --check src/Code.js         # checagem de sintaxe
 clasp push                       # envia para o Apps Script
 # rode testarParserKabum / atualizarAcompanhamento pelo editor para testar
@@ -180,6 +180,33 @@ git add -A && git commit -m "descreva a mudanca"
 | `v3` | 29/09/2026 | Data/hora com horas, `status_coleta`, Logs, Dashboard novo, `append_` que cresce a aba |
 
 Detalhes em [CHANGELOG.md](CHANGELOG.md).
+
+---
+
+## Regras para mexer no código
+
+Planilha: `1hgSeSzOpBzxyJji-S2GPG8xECaZlpr0RlBsaCNQrLZE`. Todo o código está em `src/Code.js` (Apps Script V8, sem dependências npm).
+
+- **A ordem das colunas** de `Coletas_Brutas`, `Coletas_Fatiadas`, `Historico` e `Produtos` não pode mudar sem uma função de migração: o código lê e grava por posição (ex.: `r[6]` = `preco_pix` no Historico). Coluna nova vai sempre no fim.
+- `Acompanhamento` e `Dashboard` são recriadas a cada coleta, então mudança feita à mão nelas se perde. O lugar de mudar é o código (`atualizarAcompanhamento`, `atualizarDashboard`).
+- Toda linha nova passa por `append_()`, que cresce a aba e aplica o formato de data/hora. Os logs passam por `log_()`.
+- O status de cada coleta vem de `avaliarColeta_()`. Preço "suspeito" é o que fica abaixo de `LIMITE_PRECO_SUSPEITO` × `preco_maximo` (quase sempre é o valor da parcela).
+- Estilo: ES2019 que o Apps Script V8 aceita, `const` e arrow functions, funções privadas terminam com `_`, comentários sem acento. Mensagens e textos da planilha em português.
+- Datas no fuso `America/Sao_Paulo`, formato `dd/MM/yyyy HH:mm:ss` (`DATETIME_FORMAT`).
+- Antes de `clasp push`, rodar `node --check src/Code.js`. Não existe teste automatizado: o parser se testa com `testarParserKabum()`, que só escreve no log.
+- Depois de uma mudança relevante, atualizar o `CHANGELOG.md` e, se o comportamento mudar, este README.
+
+### Mapa do código (`src/Code.js`)
+
+| Área | Funções |
+|---|---|
+| Coleta | `coletarAgora`, `collectProduct_`, `avaliarColeta_` |
+| Parser Kabum | `parseKabum_`, `extractKabumPrices_` (`__NEXT_DATA__`), `extractLdJsonPrice_`, `stripHtml_`, `findPrices_`, `parsePrice_` |
+| Abas calculadas | `atualizarAcompanhamento`, `atualizarDashboard` |
+| Histórico/preço | `getLastPrice_`, `getMinPrice_`, `precoValido_`, `getStatusPrice_`, `round2_`, `fmtBRL_` |
+| Infra | `append_`, `log_`, `formatSheet_`, `resetSheet_`, `simpleHash_` |
+| Gatilhos | `criarGatilhoDiario23h`, `criarGatilhoCada6Horas` (na prática, diário) |
+| Manutenção | `testarParserKabum`, `migrarColetasBrutasV2`, `setupMonitor` (bloqueada) |
 
 ---
 
